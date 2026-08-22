@@ -195,11 +195,10 @@ static void handle_setup(void){
 /* ---- TX ring (bulk EP2 IN) ---- */
 /* THE TX RING DROPS WHEN FULL, AND THAT USED TO BE INVISIBLE.
  *
- * 2048 bytes was not enough once the board had a request/response protocol on the same link as its
- * diagnostics. With the demo reel and the 10-second standard auto-switch both printing, a reply's
- * "#N BEGIN" marker could be discarded before it ever reached the host — so the page saw the log
- * pouring in and simultaneously reported "board did not answer", which reads as two unrelated
- * faults and is one.
+ * 2048 bytes was not enough once a board had a request/response protocol sharing the link with its
+ * diagnostics. With background output flowing, a reply's leading marker could be discarded before it
+ * ever reached the host — so the host saw the log pouring in and simultaneously reported "board did
+ * not answer", which reads as two unrelated faults and is one.
  *
  * Two changes: the ring is 8 KB, and the drops are COUNTED. A transport that discards data without
  * saying so turns a capacity problem into a protocol mystery — the same defect as a truncating
