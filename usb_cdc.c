@@ -88,6 +88,7 @@ static void av(uint32_t addr, uint32_t val){
 
 /* multi-packet EP0 IN: the 84-byte config descriptor goes as 64 + 20 (source must be static, not stack) */
 static const uint8_t *g_ep0_src; static uint16_t g_ep0_rem; static uint8_t g_ep0_data_in = 0;
+static uint8_t g_ep0_out_data = 0;      /* a control WRITE's data stage is outstanding on EP0 OUT */
 static void ep0_tx_chunk(void){
     uint16_t n = g_ep0_rem > 64u ? 64u : g_ep0_rem;
     for(uint16_t i=0;i<n;i++) ((volatile uint8_t*)EP0_BUF)[i]=g_ep0_src[i];
@@ -97,6 +98,37 @@ static void ep0_tx_chunk(void){
 static uint8_t g_strbuf[64];
 static void ep0_send(const uint8_t *d, uint16_t n){ g_ep0_src=d; g_ep0_rem=n; g_ep0_data_in=1; ep0_tx_chunk(); }
 static void ep0_status_in(void){ g_ep0pid=1; g_ep0_rem=0; g_ep0_data_in=0; av(BUF_CTRL(0,1), BUF_AVAIL|BUF_FULL|BUF_DATA1); }
+
+/* ACCEPT THE DATA STAGE OF A CONTROL WRITE.
+ *
+ * A host->device request with wLength > 0 is three stages: SETUP, an OUT DATA packet, then a
+ * zero-length IN status. This driver only ever implemented the first and last. EP0 OUT was armed
+ * in exactly one place — to send the status ZLP after an IN data stage — and NEVER to RECEIVE.
+ *
+ * So SET_LINE_CODING (0x21, 0x20, wLength 7) went: device ACKs the SETUP and immediately arms the
+ * IN status; the host then sends seven bytes of OUT data to an unarmed endpoint and is NAKed, and
+ * retries until it gives up. That request is one of the ones a host issues WHEN A PROCESS OPENS
+ * THE PORT, which is exactly where a fixed cost was measured:
+ *
+ *     five opens, four different histories (cold / after a clean close / after 10 s of unread
+ *     output / after a drained session): 53.26, 53.43, 52.63, 52.96, 52.79 s. Spread 0.8 s.
+ *
+ * A constant that no history changes is a host waiting out a timer. Enumeration was never affected
+ * because enumeration issues no control write with a data stage — which is why the device appeared
+ * instantly and then cost a minute to open.
+ *
+ * The data is received and DISCARDED, deliberately. This is a native CDC device with no UART
+ * behind it: there is no hardware that could honour a baud rate or a parity setting, so storing
+ * them would only let the device lie back more convincingly. What the host needs is the handshake
+ * completed, and that is what this does. */
+static void ep0_receive_and_ack(void){ g_ep0pid=0; g_ep0_rem=0; g_ep0_data_in=0; g_ep0_out_data=1;
+    /* BUF_DATA1 IS NOT OPTIONAL HERE. The FIRST packet of a control transfer's data stage is
+     * always DATA1 (USB 2.0 §8.5.3) — the SETUP packet is DATA0, and the stage that follows
+     * toggles. Arming this buffer for DATA0 makes the controller reject the host's packet on a
+     * PID mismatch, which is indistinguishable from never arming it at all: the host is NAKed,
+     * retries, and times out identically. The first version of this function omitted the bit and
+     * changed the measured open latency by nothing, which is what sent me looking elsewhere. */
+                                       av(BUF_CTRL(0,0), 64u | BUF_AVAIL | BUF_DATA1); }
 
 void usb_cdc_reboot_bootsel(void){                     /* reboot into the ROM USB bootloader (BOOTSEL) */
     typedef void *(*lookup_t)(uint32_t code, uint32_t flags);
@@ -113,6 +145,11 @@ void usb_cdc_reboot_bootsel(void){                     /* reboot into the ROM US
 static void handle_setup(void){
     volatile struct setup *s = (volatile struct setup *)SETUP_PKT;
     g_ep0pid = 1;
+    /* A control WRITE that carries data must have its data stage accepted before the status is
+     * sent. Checked here, once, for every host->device request rather than per-request, so a
+     * class request added later cannot reintroduce the stall by forgetting it. */
+    if(!(s->bmRequestType & 0x80) && s->wLength > 0u){ ep0_receive_and_ack(); return; }
+
     if(s->bmRequestType == 0x00){                                  /* host->device standard */
         if(s->bRequest == 5) g_pending_addr = (uint8_t)(s->wValue & 0x7F);  /* SET_ADDRESS (applied post-status) */
         ep0_status_in();
@@ -125,23 +162,60 @@ static void handle_setup(void){
             else { ascii_str(g_strbuf, idx==1?"crowdwave":idx==2?"rp2350-usb-cdc":"0001");
                    ep0_send(g_strbuf, wl<g_strbuf[0]?wl:g_strbuf[0]); } }
         else ep0_status_in();
-    } else if((s->bmRequestType & 0x60) == 0x20){                  /* CDC class (SET_LINE_CODING etc.): ACK */
-        if(s->bmRequestType & 0x80) ep0_send((const uint8_t*)"\0\0\0\0\0\0\0", 7); else ep0_status_in();
+    } else if((s->bmRequestType & 0x60) == 0x20){                  /* CDC class */
+        /* GET_LINE_CODING MUST RETURN A LEGAL CODING, AND THIS USED TO RETURN SEVEN ZEROS:
+         * dwDTERate = 0 baud and bDataBits = 0, which describes no serial port that can exist.
+         *
+         * The host reads the line coding when a process OPENS the port, which is precisely where
+         * this board spends a fixed ~53 s — measured five times across four different histories
+         * (cold, after a clean close, after unread output, after a drained session) with a spread
+         * of 0.8 s. That flatness is the tell: a constant cost that no history changes is a host
+         * waiting out a timer, not a backlog and not an unclean release.
+         *
+         * The layout is CDC PSTN 1.20 §6.3.11: dwDTERate little-endian (4), bCharFormat (1,
+         * 0 = 1 stop bit), bParityType (1, 0 = none), bDataBits (1). 115200-8-N-1.
+         *
+         * The value is FIXED rather than echoed back from SET_LINE_CODING, and that is honest
+         * rather than lazy: this is a native CDC device with no UART behind it, so the baud rate
+         * is meaningless to the hardware — nothing downstream can honour a rate the host asks
+         * for. What matters is that the answer is well-formed. Echoing the host's own request
+         * would look more correct and would tell it exactly the same lie. */
+        static const uint8_t line_coding[7] = {
+            0x00, 0xC2, 0x01, 0x00,   /* dwDTERate = 115200 = 0x0001C200, little-endian */
+            0x00,                     /* bCharFormat  = 1 stop bit  */
+            0x00,                     /* bParityType  = none        */
+            0x08                      /* bDataBits    = 8           */
+        };
+        if(s->bmRequestType & 0x80) ep0_send(line_coding, sizeof line_coding); else ep0_status_in();
     } else if(s->bmRequestType == 0x41 && s->bRequest == 0x01){    /* picotool RESET_BOOTSEL */
         ep0_status_in(); usb_cdc_reboot_bootsel();
     } else ep0_status_in();
 }
 
 /* ---- TX ring (bulk EP2 IN) ---- */
-static char g_tx[2048]; static volatile uint16_t g_th=0, g_tt=0;
-void usb_cdc_putc(char c){ uint16_t nh=(uint16_t)((g_th+1)&2047); if(nh!=g_tt){ g_tx[g_th]=c; g_th=nh; } }
+/* THE TX RING DROPS WHEN FULL, AND THAT USED TO BE INVISIBLE.
+ *
+ * 2048 bytes was not enough once the board had a request/response protocol on the same link as its
+ * diagnostics. With the demo reel and the 10-second standard auto-switch both printing, a reply's
+ * "#N BEGIN" marker could be discarded before it ever reached the host — so the page saw the log
+ * pouring in and simultaneously reported "board did not answer", which reads as two unrelated
+ * faults and is one.
+ *
+ * Two changes: the ring is 8 KB, and the drops are COUNTED. A transport that discards data without
+ * saying so turns a capacity problem into a protocol mystery — the same defect as a truncating
+ * command buffer, at the other end of the same wire. g_tx_dropped is printed by the heartbeat. */
+#define TXRING 8192u
+static char g_tx[TXRING]; static volatile uint16_t g_th=0, g_tt=0;
+volatile uint32_t g_tx_dropped = 0u;
+void usb_cdc_putc(char c){ uint16_t nh=(uint16_t)((g_th+1)&(TXRING-1u));
+                           if(nh!=g_tt){ g_tx[g_th]=c; g_th=nh; } else g_tx_dropped++; }
 void usb_cdc_puts(const char *s){ while(*s) usb_cdc_putc(*s++); }
 void usb_cdc_write(const void *data, uint32_t len){ const uint8_t *p=data; while(len--) usb_cdc_putc((char)*p++); }
 void usb_cdc_hex(uint32_t v){ usb_cdc_puts("0x"); for(int i=28;i>=0;i-=4){ uint32_t n=(v>>i)&0xF; usb_cdc_putc(n<10?('0'+n):('A'+n-10)); } }
 
 static void tx_pump(void){
     if((REG(BUF_CTRL(2,1)) & BUF_AVAIL) || g_tt==g_th) return;     /* send only when the buffer is free + data queued */
-    uint16_t n=0; while(g_tt!=g_th && n<64){ ((volatile uint8_t*)EP2_IN_BUF)[n++]=(uint8_t)g_tx[g_tt]; g_tt=(uint16_t)((g_tt+1)&2047); }
+    uint16_t n=0; while(g_tt!=g_th && n<64){ ((volatile uint8_t*)EP2_IN_BUF)[n++]=(uint8_t)g_tx[g_tt]; g_tt=(uint16_t)((g_tt+1)&(TXRING-1u)); }
     av(BUF_CTRL(2,1), (uint32_t)n | BUF_AVAIL | BUF_FULL | (g_txpid?BUF_DATA1:0)); g_txpid^=1u;
 }
 
@@ -232,6 +306,10 @@ void usb_cdc_task(void){
     uint32_t bs = REG(BUFF_STATUS);
     if(bs){
         REG(BUFF_STATUS) = bs;
+        if(bs & 0x2u && g_ep0_out_data){               /* EP0 OUT: a control write's data arrived */
+            g_ep0_out_data = 0;
+            ep0_status_in();                           /* now, and only now, the status stage */
+        }
         if(bs & 0x1u){                                 /* EP0 IN buffer done */
             if(g_ep0_rem > 0u) ep0_tx_chunk();         /* continue a multi-packet descriptor */
             else if(g_ep0_data_in){ g_ep0_data_in=0; g_ep0pid=1; av(BUF_CTRL(0,0), BUF_AVAIL|BUF_DATA1); } /* arm status ZLP */

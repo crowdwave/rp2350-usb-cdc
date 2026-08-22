@@ -12,7 +12,7 @@ void usb_cdc_init(void);
  * it uses no interrupts, so nothing happens on USB unless you call this. */
 void usb_cdc_task(void);
 
-/* Send to the host. Bytes are buffered (2 KB ring) and flushed by usb_cdc_task(). Non-blocking;
+/* Send to the host. Bytes are buffered (8 KB ring) and flushed by usb_cdc_task(). Non-blocking;
  * bytes are dropped if the ring is full and the host isn't reading. */
 void usb_cdc_putc(char c);
 void usb_cdc_puts(const char *s);
@@ -27,5 +27,10 @@ void usb_cdc_on_rx(char c);
 /* Reboot into the ROM USB bootloader (BOOTSEL / mass-storage flashing mode). This is also invoked
  * automatically when a host tool (e.g. `picotool ... -f`) sends the reset request to our vendor interface. */
 void usb_cdc_reboot_bootsel(void);
+
+/* Bytes discarded because the TX ring was full — the host was not draining it. A transport that
+ * discards silently turns a capacity problem into a protocol mystery, so the count is exposed and
+ * is worth printing from a heartbeat. */
+extern volatile uint32_t g_tx_dropped;
 
 #endif /* USB_CDC_H */

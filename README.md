@@ -146,6 +146,18 @@ Other RP2350-specific requirements that are easy to get wrong (all handled here)
   ordinary boards.
 - **`PHY_ISO`** (the USB PHY isolation bit) defaults to *isolated*; writing `MAIN_CTRL = CONTROLLER_EN`
   clears it as a side effect.
+- **A control write's DATA STAGE must be accepted, not just its SETUP.** A host->device request with
+  `wLength > 0` is three stages: SETUP, an OUT data packet, then a zero-length IN status. Arming the
+  status immediately leaves the host's data packet hitting an unarmed endpoint, and it retries until it
+  gives up. `SET_LINE_CODING` is one of the requests a host issues **when a process opens the port**,
+  so enumeration looks instant and then opening the device costs a fixed **~53 seconds** — measured five
+  times across four different histories (cold, after a clean close, after unread output, after a drained
+  session), spread 0.8 s. A constant that no history changes is a host waiting out a timer.
+  Note the first packet of that data stage is **DATA1**, not DATA0 (USB 2.0 §8.5.3); arming for DATA0
+  fails identically to not arming at all.
+- **`GET_LINE_CODING` must return a legal coding.** Returning seven zeros describes 0 baud and 0 data
+  bits — a port that cannot exist — and costs the same open-time stall. The value can be fixed rather
+  than echoed back: with no UART behind it, no rate could be honoured anyway.
 - **DPRAM hates widened accesses** — copy to/from the USB DPRAM byte-by-byte (`volatile`), or aligned
   32-bit; a compiler-widened byte copy can hard-fault.
 
@@ -153,7 +165,7 @@ Other RP2350-specific requirements that are easy to get wrong (all handled here)
 
 - The USB VID/PID is `0x2e8a:0x000a` (Raspberry Pi's). Keeping it is what lets `picotool -f` recognise and
   reset the device. For a shipping product you should use your own VID/PID (and then `picotool -f` won't apply).
-- Full-speed (12 Mbit/s) CDC. Single interface, single serial port. TX is a 2 KB ring; bytes are dropped if
+- Full-speed (12 Mbit/s) CDC. Single interface, single serial port. TX is an 8 KB ring; bytes are dropped if
   the host isn't draining and the ring fills (typical for "nobody has the port open" — that's fine).
 - The driver assumes it owns the USB controller and (in `usb_cdc_init`) the XOSC, PLL_USB, `clk_usb` and
   `clk_sys`. It does not touch PLL_SYS.
